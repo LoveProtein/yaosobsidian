@@ -18,6 +18,7 @@ import {
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
 const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
+const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[yaos-sync:server]";
 
@@ -194,29 +195,56 @@ export class VaultSyncServer extends YServer {
 	private enqueueSave(delta: Uint8Array, persistedStateVector: Uint8Array): Promise<void> {
 		const run = this.saveChain.then(async () => {
 			const store = this.getChunkedDocStore();
-			const journalStats = await store.appendUpdate(delta);
-			if (
-				journalStats.entryCount > JOURNAL_COMPACT_MAX_ENTRIES
-				|| journalStats.totalBytes > JOURNAL_COMPACT_MAX_BYTES
-			) {
-				const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
-				const checkpointStateVector = Y.encodeStateVector(this.document);
-				await store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
-				await this.recordTrace("checkpoint-fallback-triggered", {
-					reason: "journal-compaction-threshold-exceeded",
-					journalEntryCount: journalStats.entryCount,
-					journalBytes: journalStats.totalBytes,
-					maxJournalEntries: JOURNAL_COMPACT_MAX_ENTRIES,
-					maxJournalBytes: JOURNAL_COMPACT_MAX_BYTES,
-					note: "clients behind compaction boundary may require checkpoint-based catchup",
-				});
-				this.lastSavedStateVector = checkpointStateVector;
+			if (delta.byteLength > CHECKPOINT_FALLBACK_DELTA_BYTES) {
+				try {
+					await this.rewriteCheckpoint(store, "delta-exceeds-threshold", delta.byteLength);
+				} catch (error) {
+					console.error(`${LOG_PREFIX} direct checkpoint fallback failed:`, error);
+				}
 				return;
 			}
-			this.lastSavedStateVector = persistedStateVector;
+
+			try {
+				const journalStats = await store.appendUpdate(delta);
+				if (
+					journalStats.entryCount > JOURNAL_COMPACT_MAX_ENTRIES
+					|| journalStats.totalBytes > JOURNAL_COMPACT_MAX_BYTES
+				) {
+					await this.rewriteCheckpoint(
+						store,
+						"journal-compaction-threshold-exceeded",
+						delta.byteLength,
+					);
+					return;
+				}
+				this.lastSavedStateVector = persistedStateVector;
+			} catch (error) {
+				console.error(`${LOG_PREFIX} journal append failed; attempting checkpoint fallback:`, error);
+				try {
+					await this.rewriteCheckpoint(store, "journal-append-failed", delta.byteLength);
+				} catch (fallbackError) {
+					console.error(`${LOG_PREFIX} checkpoint fallback failed:`, fallbackError);
+				}
+			}
 		});
 		this.saveChain = run.catch(() => undefined);
 		return run;
+	}
+
+	private async rewriteCheckpoint(
+		store: ChunkedDocStore,
+		reason: string,
+		deltaBytes: number,
+	): Promise<void> {
+		const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
+		const checkpointStateVector = Y.encodeStateVector(this.document);
+		await store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
+		this.lastSavedStateVector = checkpointStateVector;
+		await this.recordTrace("checkpoint-fallback-succeeded", {
+			reason,
+			deltaBytes,
+			checkpointBytes: checkpointUpdate.byteLength,
+		});
 	}
 
 	private async readRoomMetaCheap(): Promise<RoomMeta | null> {
