@@ -14,9 +14,11 @@ const JOURNAL_META_KEY = "document:journal:meta";
 const JOURNAL_MANIFEST_PREFIX = "document:journal:manifest:";
 const JOURNAL_CHUNK_PREFIX = "document:journal:chunk:";
 
-const DEFAULT_CHUNK_SIZE_BYTES = 512 * 1024;
+// Keep well below the Durable Object SQLite value limit. Existing manifests carry
+// their own chunk size, so lowering this only affects newly written checkpoints.
+const DEFAULT_CHUNK_SIZE_BYTES = 64 * 1024;
 // Durable Object SQLite rejects a single storage.put payload above its blob limit.
-// Keep each write to one 512 KiB chunk even when the logical document is much larger.
+// Keep each write to one chunk even when the logical document is much larger.
 const DEFAULT_MAX_KEYS_PER_OPERATION = 1;
 
 interface ManifestPointer {
