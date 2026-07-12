@@ -421,7 +421,9 @@ export class ChunkedDocStore {
 		const stateVectorBytes = normalizeBytes(stateVector, "rewriteCheckpoint(stateVector)");
 		const updateHash = await sha256Hex(updateBytes);
 		const stateVectorHash = await sha256Hex(stateVectorBytes);
+		let stage = "read current checkpoint";
 
+		try {
 		const cleanupKeys = new Set<string>();
 		const existingPointerRaw = await this.storage.get<unknown>(CHECKPOINT_POINTER_KEY);
 		const existingPointer = existingPointerRaw === undefined
@@ -445,6 +447,7 @@ export class ChunkedDocStore {
 			}
 		}
 
+		stage = "read journal metadata";
 		const journalMeta = await this.readJournalMeta(this.storage);
 		if (journalMeta.entryCount > 0) {
 			const seqs = expectedJournalSeqs(journalMeta);
@@ -474,6 +477,7 @@ export class ChunkedDocStore {
 
 		const newVersion = existingPointer ? existingPointer.version + 1 : 1;
 		const now = new Date().toISOString();
+		stage = "write checkpoint chunks";
 		const chunkCount = await putChunkedPayloadBatched(
 			this.storage,
 			updateBytes,
@@ -495,6 +499,7 @@ export class ChunkedDocStore {
 
 		// Write an unreferenced checkpoint first. The tiny transaction below makes it visible
 		// atomically with clearing the journal, so a failed write leaves the old state intact.
+		stage = "write checkpoint metadata";
 		await putEntriesBatched(
 			this.storage,
 			[
@@ -503,6 +508,7 @@ export class ChunkedDocStore {
 			],
 			this.maxKeysPerOperation,
 		);
+		stage = "commit checkpoint pointer";
 		await this.storage.transaction(async (txn) => {
 			await txn.put({
 				[CHECKPOINT_POINTER_KEY]: { version: newVersion } satisfies ManifestPointer,
@@ -512,7 +518,12 @@ export class ChunkedDocStore {
 
 		// Cleanup is deliberately after the pointer switch. Orphaned old chunks are safe if
 		// cleanup is interrupted, while deleting them before the switch would risk data loss.
+		stage = "cleanup superseded checkpoint";
 		await deleteKeysBatched(this.storage, Array.from(cleanupKeys), this.maxKeysPerOperation);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`checkpoint ${stage} failed: ${message}`);
+		}
 	}
 
 	async loadLatest(): Promise<Uint8Array | null> {
