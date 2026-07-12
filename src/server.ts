@@ -14,11 +14,9 @@ import {
 	prepareTraceEntryForStorage,
 	type TraceEntry as StoredTraceEntry,
 } from "./traceStore";
+import { PersistenceCoordinator } from "./persistenceCoordinator";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
-const JOURNAL_COMPACT_MAX_ENTRIES = 50;
-const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
-const CHECKPOINT_FALLBACK_DELTA_BYTES = 2 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[yaos-sync:server]";
 
@@ -26,14 +24,6 @@ interface ServerTraceEntry extends StoredTraceEntry {}
 
 interface ServerEnv {
 	YAOS_BUCKET?: R2Bucket;
-}
-
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.byteLength !== b.byteLength) return false;
-	for (let i = 0; i < a.byteLength; i++) {
-		if (a[i] !== b[i]) return false;
-	}
-	return true;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -55,9 +45,8 @@ export class VaultSyncServer extends YServer {
 	private loadPromise: Promise<void> | null = null;
 	private roomIdHint: string | null = null;
 	private chunkedDocStore: ChunkedDocStore | null = null;
-	private saveChain: Promise<void> = Promise.resolve();
+	private persistence: PersistenceCoordinator | null = null;
 	private snapshotMaybeChain: Promise<void> = Promise.resolve();
-	private lastSavedStateVector: Uint8Array | null = null;
 	private roomMeta: RoomMeta | null = null;
 
 	async onLoad(): Promise<void> {
@@ -66,18 +55,10 @@ export class VaultSyncServer extends YServer {
 
 	async onSave(): Promise<void> {
 		await this.ensureDocumentLoaded();
-		const baseStateVector = this.lastSavedStateVector;
-		const persistedStateVector = Y.encodeStateVector(this.document);
-		if (baseStateVector && equalBytes(baseStateVector, persistedStateVector)) {
-			return;
+		const result = await this.getPersistenceCoordinator().enqueueSave();
+		if (!result.success) {
+			console.error(`${LOG_PREFIX} save failed; retaining pending state for retry:`, result.error);
 		}
-		const delta = baseStateVector
-			? Y.encodeStateAsUpdate(this.document, baseStateVector)
-			: Y.encodeStateAsUpdate(this.document);
-		if (delta.byteLength === 0) {
-			return;
-		}
-		await this.enqueueSave(delta, persistedStateVector);
 		await this.syncRoomMetaFromDocument();
 	}
 
@@ -155,11 +136,12 @@ export class VaultSyncServer extends YServer {
 				Y.applyUpdate(this.document, update);
 			}
 
-			this.lastSavedStateVector = (
+			const initialStateVector = (
 				state.checkpointStateVector && state.journalUpdates.length === 0
 			)
 				? state.checkpointStateVector.slice()
 				: Y.encodeStateVector(this.document);
+			this.getPersistenceCoordinator().setInitialStateVector(initialStateVector);
 			this.documentLoaded = true;
 			await this.syncRoomMetaFromDocument();
 			await this.recordTrace("checkpoint-load", {
@@ -192,59 +174,17 @@ export class VaultSyncServer extends YServer {
 		return this.chunkedDocStore;
 	}
 
-	private enqueueSave(delta: Uint8Array, persistedStateVector: Uint8Array): Promise<void> {
-		const run = this.saveChain.then(async () => {
-			const store = this.getChunkedDocStore();
-			if (delta.byteLength > CHECKPOINT_FALLBACK_DELTA_BYTES) {
-				try {
-					await this.rewriteCheckpoint(store, "delta-exceeds-threshold", delta.byteLength);
-				} catch (error) {
-					console.error(`${LOG_PREFIX} direct checkpoint fallback failed:`, error);
-				}
-				return;
-			}
-
-			try {
-				const journalStats = await store.appendUpdate(delta);
-				if (
-					journalStats.entryCount > JOURNAL_COMPACT_MAX_ENTRIES
-					|| journalStats.totalBytes > JOURNAL_COMPACT_MAX_BYTES
-				) {
-					await this.rewriteCheckpoint(
-						store,
-						"journal-compaction-threshold-exceeded",
-						delta.byteLength,
-					);
-					return;
-				}
-				this.lastSavedStateVector = persistedStateVector;
-			} catch (error) {
-				console.error(`${LOG_PREFIX} journal append failed; attempting checkpoint fallback:`, error);
-				try {
-					await this.rewriteCheckpoint(store, "journal-append-failed", delta.byteLength);
-				} catch (fallbackError) {
-					console.error(`${LOG_PREFIX} checkpoint fallback failed:`, fallbackError);
-				}
-			}
-		});
-		this.saveChain = run.catch(() => undefined);
-		return run;
-	}
-
-	private async rewriteCheckpoint(
-		store: ChunkedDocStore,
-		reason: string,
-		deltaBytes: number,
-	): Promise<void> {
-		const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
-		const checkpointStateVector = Y.encodeStateVector(this.document);
-		await store.rewriteCheckpoint(checkpointUpdate, checkpointStateVector);
-		this.lastSavedStateVector = checkpointStateVector;
-		await this.recordTrace("checkpoint-fallback-succeeded", {
-			reason,
-			deltaBytes,
-			checkpointBytes: checkpointUpdate.byteLength,
-		});
+	private getPersistenceCoordinator(): PersistenceCoordinator {
+		if (!this.persistence) {
+			this.persistence = new PersistenceCoordinator(
+				this.document,
+				this.getChunkedDocStore(),
+				(event, data) => {
+					void this.recordTrace(`persistence.${event}`, data);
+				},
+			);
+		}
+		return this.persistence;
 	}
 
 	private async readRoomMetaCheap(): Promise<RoomMeta | null> {
