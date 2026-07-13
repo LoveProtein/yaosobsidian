@@ -118,6 +118,17 @@ export class VaultSyncServer extends YServer {
 			return json(await this.createDailySnapshotMaybe(body.device));
 		}
 
+		if (request.method === "POST" && url.pathname === "/__yaos/snapshot-now") {
+			await this.ensureDocumentLoaded();
+			let body: { device?: string } = {};
+			try {
+				body = await request.json();
+			} catch {
+				body = {};
+			}
+			return json(await this.createSnapshotNow(body.device));
+		}
+
 		await this.ensureDocumentLoaded();
 		return super.fetch(request);
 	}
@@ -255,6 +266,36 @@ export class VaultSyncServer extends YServer {
 					return {
 						status: "noop",
 						reason: `Snapshot already taken today (${currentDay})`,
+					} satisfies SnapshotResult;
+				}
+
+				const index = await createSnapshot(
+					this.document,
+					this.getRoomId(),
+					bucket,
+					triggeredBy,
+				);
+				return {
+					status: "created",
+					snapshotId: index.snapshotId,
+					index,
+				} satisfies SnapshotResult;
+			},
+		);
+		this.snapshotMaybeChain = serialized.chain;
+		return await run;
+	}
+
+	private async createSnapshotNow(triggeredBy?: string): Promise<SnapshotResult> {
+		const serialized = { chain: this.snapshotMaybeChain };
+		const run = runSerialized(
+			serialized,
+			async () => {
+				const bucket = (this.env as ServerEnv).YAOS_BUCKET;
+				if (!bucket) {
+					return {
+						status: "unavailable",
+						reason: "R2 bucket not configured",
 					} satisfies SnapshotResult;
 				}
 

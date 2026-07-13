@@ -5,7 +5,6 @@ import { sha256Hex } from "./hex";
 import { ServerConfig, type StoredServerConfig } from "./config";
 import {
 	blobKey,
-	createSnapshot,
 	getSnapshotPayload,
 	hasSnapshotForDay,
 	listSnapshots,
@@ -504,32 +503,6 @@ async function handleBlobDownload(
 	return new Response(object.body, { headers });
 }
 
-async function createSnapshotFromLiveDoc(
-	env: Env,
-	vaultId: string,
-	triggeredBy?: string,
-): Promise<SnapshotResult> {
-	if (!env.YAOS_BUCKET) {
-		return {
-			status: "unavailable",
-			reason: "R2 bucket not configured",
-		};
-	}
-
-	const update = await fetchVaultDocument(env, vaultId);
-	const doc = new Y.Doc();
-	if (update.byteLength > 0) {
-		Y.applyUpdate(doc, update);
-	}
-
-	const index = await createSnapshot(doc, vaultId, env.YAOS_BUCKET, triggeredBy);
-	return {
-		status: "created",
-		snapshotId: index.snapshotId,
-		index,
-	};
-}
-
 const worker = {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const url = new URL(req.url);
@@ -796,11 +769,15 @@ const worker = {
 					body = {};
 				}
 
-				const result = await createSnapshotFromLiveDoc(
-					env,
-					vaultRoute.vaultId,
-					body.device,
-				);
+				const stub = await getServerByName(env.YAOS_SYNC, vaultRoute.vaultId);
+				const res = await stub.fetch("https://internal/__yaos/snapshot-now", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify(body),
+				});
+				const result = await res.json() as SnapshotResult;
 				if (result.status === "unavailable") {
 					return withCors(json(result));
 				}
