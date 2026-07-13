@@ -35,6 +35,7 @@ interface CheckpointManifest {
 	stateVectorByteLength: number;
 	stateVectorSha256: string;
 	updatedAt: string;
+	r2Key?: string;
 }
 
 interface StorageLike {
@@ -80,6 +81,8 @@ interface ChunkDescriptor {
 export interface ChunkedDocStoreOptions {
 	chunkSizeBytes?: number;
 	maxKeysPerOperation?: number;
+	checkpointBucket?: R2Bucket;
+	checkpointPrefix?: string;
 }
 
 export interface JournalStats {
@@ -149,6 +152,7 @@ function isChunkedManifest(value: unknown): value is CheckpointManifest {
 	if (!Number.isInteger(m.stateVectorByteLength) || m.stateVectorByteLength < 0) return false;
 	if (typeof m.stateVectorSha256 !== "string" || !/^[0-9a-f]{64}$/.test(m.stateVectorSha256)) return false;
 	if (typeof m.updatedAt !== "string" || m.updatedAt.length === 0) return false;
+	if (m.r2Key !== undefined && (typeof m.r2Key !== "string" || m.r2Key.length === 0)) return false;
 	return true;
 }
 
@@ -344,6 +348,8 @@ async function readChunkedPayload(
 export class ChunkedDocStore {
 	private readonly chunkSizeBytes: number;
 	private readonly maxKeysPerOperation: number;
+	private readonly checkpointBucket: R2Bucket | undefined;
+	private readonly checkpointPrefix: string | undefined;
 
 	constructor(
 		private readonly storage: StorageLike,
@@ -351,6 +357,13 @@ export class ChunkedDocStore {
 	) {
 		this.chunkSizeBytes = options.chunkSizeBytes ?? DEFAULT_CHUNK_SIZE_BYTES;
 		this.maxKeysPerOperation = options.maxKeysPerOperation ?? DEFAULT_MAX_KEYS_PER_OPERATION;
+		this.checkpointBucket = options.checkpointBucket;
+		this.checkpointPrefix = options.checkpointPrefix?.replace(/\/+$/, "");
+	}
+
+	private checkpointObjectKey(version: number): string | null {
+		if (!this.checkpointBucket || !this.checkpointPrefix) return null;
+		return `${this.checkpointPrefix}/checkpoint-${version}.bin`;
 	}
 
 	async loadState(): Promise<LoadedDocState> {
@@ -427,6 +440,7 @@ export class ChunkedDocStore {
 
 		try {
 		const cleanupKeys = new Set<string>();
+		const cleanupR2Keys: string[] = [];
 		const existingPointerRaw = await this.storage.get<unknown>(CHECKPOINT_POINTER_KEY);
 		const existingPointer = existingPointerRaw === undefined
 			? null
@@ -444,8 +458,12 @@ export class ChunkedDocStore {
 			}
 			cleanupKeys.add(oldManifestKey);
 			cleanupKeys.add(checkpointStateVectorKey(existingPointer.version));
-			for (let i = 0; i < oldManifestRaw.chunkCount; i++) {
-				cleanupKeys.add(checkpointChunkKey(oldManifestRaw.version, i));
+			if (oldManifestRaw.r2Key) {
+				cleanupR2Keys.push(oldManifestRaw.r2Key);
+			} else {
+				for (let i = 0; i < oldManifestRaw.chunkCount; i++) {
+					cleanupKeys.add(checkpointChunkKey(oldManifestRaw.version, i));
+				}
 			}
 		}
 
@@ -479,14 +497,21 @@ export class ChunkedDocStore {
 
 		const newVersion = existingPointer ? existingPointer.version + 1 : 1;
 		const now = new Date().toISOString();
-		stage = "write checkpoint chunks";
-		const chunkCount = await putChunkedPayloadBatched(
-			this.storage,
-			updateBytes,
-			this.chunkSizeBytes,
-			(i) => checkpointChunkKey(newVersion, i),
-			this.maxKeysPerOperation,
-		);
+		const r2Key = this.checkpointObjectKey(newVersion);
+		let chunkCount = 0;
+		if (r2Key) {
+			stage = "write R2 checkpoint";
+			await this.checkpointBucket!.put(r2Key, updateBytes);
+		} else {
+			stage = "write checkpoint chunks";
+			chunkCount = await putChunkedPayloadBatched(
+				this.storage,
+				updateBytes,
+				this.chunkSizeBytes,
+				(i) => checkpointChunkKey(newVersion, i),
+				this.maxKeysPerOperation,
+			);
+		}
 		const manifest: CheckpointManifest = {
 			format: CHECKPOINT_FORMAT,
 			version: newVersion,
@@ -497,6 +522,7 @@ export class ChunkedDocStore {
 			stateVectorByteLength: stateVectorBytes.byteLength,
 			stateVectorSha256: stateVectorHash,
 			updatedAt: now,
+			...(r2Key ? { r2Key } : {}),
 		};
 
 		// Write an unreferenced checkpoint first. The tiny transaction below makes it visible
@@ -522,6 +548,9 @@ export class ChunkedDocStore {
 		// cleanup is interrupted, while deleting them before the switch would risk data loss.
 		stage = "cleanup superseded checkpoint";
 		await deleteKeysBatched(this.storage, Array.from(cleanupKeys), this.maxKeysPerOperation);
+		for (const key of cleanupR2Keys) {
+			await this.checkpointBucket?.delete(key);
+		}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			throw new Error(`checkpoint ${stage} failed: ${message}`);
@@ -571,13 +600,34 @@ export class ChunkedDocStore {
 			);
 		}
 
-		const update = await readChunkedPayload(
-			this.storage,
-			rawManifest,
-			(i) => checkpointChunkKey(rawManifest.version, i),
-			"checkpoint",
-			this.maxKeysPerOperation,
-		);
+		let update: Uint8Array;
+		if (rawManifest.r2Key) {
+			if (!this.checkpointBucket) {
+				throw new Error("checkpoint is stored in R2 but the bucket is not configured");
+			}
+			const object = await this.checkpointBucket.get(rawManifest.r2Key);
+			if (!object) {
+				throw new Error(`checkpoint object is missing from R2: ${rawManifest.r2Key}`);
+			}
+			update = new Uint8Array(await object.arrayBuffer());
+			if (update.byteLength !== rawManifest.byteLength) {
+				throw new Error(
+					`checkpoint R2 length mismatch (expected ${rawManifest.byteLength}, got ${update.byteLength})`,
+				);
+			}
+			const updateHash = await sha256Hex(update);
+			if (updateHash !== rawManifest.sha256) {
+				throw new Error("checkpoint R2 sha256 mismatch");
+			}
+		} else {
+			update = await readChunkedPayload(
+				this.storage,
+				rawManifest,
+				(i) => checkpointChunkKey(rawManifest.version, i),
+				"checkpoint",
+				this.maxKeysPerOperation,
+			);
+		}
 
 		const rawStateVector = await this.storage.get<unknown>(checkpointStateVectorKey(rawManifest.version));
 		if (rawStateVector === undefined) {

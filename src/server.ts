@@ -169,7 +169,11 @@ export class VaultSyncServer extends YServer {
 
 	private getChunkedDocStore(): ChunkedDocStore {
 		if (!this.chunkedDocStore) {
-			this.chunkedDocStore = new ChunkedDocStore(this.ctx.storage);
+			const bucket = (this.env as ServerEnv).YAOS_BUCKET;
+			this.chunkedDocStore = new ChunkedDocStore(this.ctx.storage, {
+				checkpointBucket: bucket,
+				checkpointPrefix: bucket ? `v1/${this.getRoomId()}/checkpoints` : undefined,
+			});
 		}
 		return this.chunkedDocStore;
 	}
